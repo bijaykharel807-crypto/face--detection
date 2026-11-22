@@ -94,15 +94,35 @@ def load_opencv_cascades() -> Dict[str, object]:
         except Exception:
             pass
 
-    frontal_xml = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    profile_xml = cv2.data.haarcascades + "haarcascade_profileface.xml"
-    eye_xml = cv2.data.haarcascades + "haarcascade_eye.xml"
+    cascade_cls = getattr(cv2, "CascadeClassifier", None)
+    if cascade_cls is None and hasattr(cv2, "objdetect"):
+        cascade_cls = getattr(cv2.objdetect, "CascadeClassifier", None)
+
+    cv2_data = getattr(cv2, "data", None)
+    haarcascades_dir = getattr(cv2_data, "haarcascades", "") if cv2_data is not None else ""
+
+    def _safe_cascade(xml_name: str):
+        if cascade_cls is None or not haarcascades_dir:
+            return None
+        xml_path = os.path.join(haarcascades_dir, xml_name)
+        if not os.path.exists(xml_path):
+            return None
+        try:
+            clf = cascade_cls(xml_path)
+            return clf if not clf.empty() else None
+        except Exception:
+            return None
+
+    frontal = _safe_cascade("haarcascade_frontalface_default.xml")
+    profile = _safe_cascade("haarcascade_profileface.xml")
+    eye = _safe_cascade("haarcascade_eye.xml")
+    fallback_artifact = os.path.join(haarcascades_dir, "haarcascade_frontalface_default.xml") if haarcascades_dir else "OpenCV YCrCb+HOG Geometry Fallback"
     return {
-        "frontal": cv2.CascadeClassifier(frontal_xml),
-        "profile": cv2.CascadeClassifier(profile_xml),
-        "eye": cv2.CascadeClassifier(eye_xml),
+        "frontal": frontal,
+        "profile": profile,
+        "eye": eye,
         "config": haar_cfg,
-        "artifact_path": str(haar_json_path) if haar_json_path else frontal_xml,
+        "artifact_path": str(haar_json_path) if haar_json_path else fallback_artifact,
     }
 
 
@@ -540,7 +560,7 @@ def detect_faces_with_landmarks(
     raw_boxes = []
     raw_scores = []
 
-    if not haar["frontal"].empty():
+    if haar["frontal"] is not None and not haar["frontal"].empty():
         for (x, y, w, h) in haar["frontal"].detectMultiScale(
             gray_eq, scaleFactor=1.08, minNeighbors=min_neighbors, minSize=(min_face_size, min_face_size)
         ):
@@ -548,27 +568,31 @@ def detect_faces_with_landmarks(
             roi_gray = gray_eq[y : y + int(h * 0.6), x : x + w]
             eyes = (
                 haar["eye"].detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=3, minSize=(10, 10))
-                if roi_gray.size > 0 and not haar["eye"].empty()
+                if roi_gray.size > 0 and haar["eye"] is not None and not haar["eye"].empty()
                 else ()
             )
             conf = 0.94 if len(eyes) >= 2 else 0.87 if len(eyes) == 1 else 0.78
             raw_scores.append(conf)
 
-    if not haar["profile"].empty():
+    if haar["profile"] is not None and not haar["profile"].empty():
         for (x, y, w, h) in haar["profile"].detectMultiScale(
             gray_eq, scaleFactor=1.1, minNeighbors=min_neighbors, minSize=(min_face_size, min_face_size)
         ):
             raw_boxes.append([x, y, x + w, y + h])
             raw_scores.append(0.81)
 
-    # Secondary skin/geometry fallback for synthetic portraits
+    # Secondary skin/geometry fallback (used for synthetic portraits or OpenCV builds without Haar XMLs)
     if not raw_boxes:
         ycrcb = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
         skin_mask = cv2.inRange(ycrcb, np.array([60, 133, 77]), np.array([255, 173, 127]))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel)
+        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel)
         num_labels, _, stats, _ = cv2.connectedComponentsWithStats(skin_mask)
         for lbl in range(1, num_labels):
             x, y, w, h, area = stats[lbl]
-            if w >= min_face_size and h >= min_face_size and area > 800:
+            aspect = w / max(1.0, float(h))
+            if w >= min_face_size and h >= min_face_size and area > 800 and 0.45 <= aspect <= 1.65:
                 raw_boxes.append([x, y, x + w, y + h])
                 raw_scores.append(0.91)
 
@@ -586,7 +610,7 @@ def detect_faces_with_landmarks(
         roi_gray = gray_eq[max(0, y1) : max(0, y1 + int(h * 0.6)), max(0, x1) : max(0, x2)]
         eyes = (
             haar["eye"].detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=3, minSize=(8, 8))
-            if roi_gray.size > 0 and not haar["eye"].empty()
+            if roi_gray.size > 0 and haar["eye"] is not None and not haar["eye"].empty()
             else ()
         )
         if len(eyes) >= 2:
