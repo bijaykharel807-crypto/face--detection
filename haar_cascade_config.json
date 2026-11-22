@@ -1,0 +1,10 @@
+{
+  "model": "Viola-Jones Haar Cascade",
+  "scaleFactor": 1.1,
+  "minNeighbors": 5,
+  "minSize": [
+    30,
+    30
+  ],
+  "integral_image_verified": true
+}
