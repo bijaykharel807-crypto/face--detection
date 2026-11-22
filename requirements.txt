@@ -1,8 +1,9 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
-streamlit>=1.32.0
-numpy>=1.26.0,<2.0.0
-opencv-python-headless>=4.9.0,<4.11.0
+streamlit>=1.40.0
+numpy>=1.26.0
+opencv-python-headless>=4.10.0.84
 Pillow>=10.2.0
-pandas>=2.1.0
-torch==2.4.1+cpu; sys_platform == "linux"
+pandas>=2.2.0
+torch==2.6.0+cpu; sys_platform == "linux" and python_version >= "3.13"
+torch==2.4.1+cpu; sys_platform == "linux" and python_version < "3.13"
 torch>=2.2.0; sys_platform != "linux"

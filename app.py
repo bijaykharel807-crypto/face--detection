@@ -16,6 +16,7 @@ Run locally:
     streamlit run app.py
 """
 
+import inspect
 import io
 import json
 import os
@@ -24,14 +25,10 @@ import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import cv2
-import numpy as np
-import pandas as pd
 import streamlit as st
-from PIL import Image
 
 # ---------------------------------------------------------------------------
-# Immediate Page Config (Renders UI before any heavy ML library loads)
+# Immediate Page Config (Must run before any other Streamlit call or ML import)
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="Multi-Model Face Detection Studio",
@@ -39,6 +36,36 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+try:
+    import cv2
+
+    CV2_AVAILABLE = True
+    CV2_ERROR = ""
+except Exception as exc:
+    cv2 = None  # type: ignore[assignment]
+    CV2_AVAILABLE = False
+    CV2_ERROR = str(exc)
+
+
+def render_image(image, caption: Optional[str] = None, full_width: bool = True, width: Optional[int] = None) -> None:
+    """Version-safe wrapper for st.image across Streamlit 1.28 through 1.55+."""
+    params = inspect.signature(st.image).parameters
+    kwargs: dict = {}
+    if caption is not None:
+        kwargs["caption"] = caption
+    if width is not None:
+        kwargs["width"] = width
+    elif full_width:
+        if "use_container_width" in params:
+            kwargs["use_container_width"] = True
+        elif "use_column_width" in params:
+            kwargs["use_column_width"] = True
+    st.image(image, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -87,8 +114,8 @@ def load_hog_weights() -> Optional[dict]:
     try:
         npz = np.load(hog_path)
         return {
-            "weights": npz["weights"],
-            "bias": float(npz["bias"]),
+            "weights": np.asarray(npz["weights"], dtype=np.float32).reshape(-1),
+            "bias": float(np.asarray(npz["bias"], dtype=np.float32).reshape(-1)[0]),
             "artifact_path": str(hog_path),
         }
     except Exception:
@@ -513,20 +540,26 @@ def detect_faces_with_landmarks(
     raw_boxes = []
     raw_scores = []
 
-    for (x, y, w, h) in haar["frontal"].detectMultiScale(
-        gray_eq, scaleFactor=1.08, minNeighbors=min_neighbors, minSize=(min_face_size, min_face_size)
-    ):
-        raw_boxes.append([x, y, x + w, y + h])
-        roi_gray = gray_eq[y : y + int(h * 0.6), x : x + w]
-        eyes = haar["eye"].detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=3, minSize=(10, 10))
-        conf = 0.94 if len(eyes) >= 2 else 0.87 if len(eyes) == 1 else 0.78
-        raw_scores.append(conf)
+    if not haar["frontal"].empty():
+        for (x, y, w, h) in haar["frontal"].detectMultiScale(
+            gray_eq, scaleFactor=1.08, minNeighbors=min_neighbors, minSize=(min_face_size, min_face_size)
+        ):
+            raw_boxes.append([x, y, x + w, y + h])
+            roi_gray = gray_eq[y : y + int(h * 0.6), x : x + w]
+            eyes = (
+                haar["eye"].detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=3, minSize=(10, 10))
+                if roi_gray.size > 0 and not haar["eye"].empty()
+                else ()
+            )
+            conf = 0.94 if len(eyes) >= 2 else 0.87 if len(eyes) == 1 else 0.78
+            raw_scores.append(conf)
 
-    for (x, y, w, h) in haar["profile"].detectMultiScale(
-        gray_eq, scaleFactor=1.1, minNeighbors=min_neighbors, minSize=(min_face_size, min_face_size)
-    ):
-        raw_boxes.append([x, y, x + w, y + h])
-        raw_scores.append(0.81)
+    if not haar["profile"].empty():
+        for (x, y, w, h) in haar["profile"].detectMultiScale(
+            gray_eq, scaleFactor=1.1, minNeighbors=min_neighbors, minSize=(min_face_size, min_face_size)
+        ):
+            raw_boxes.append([x, y, x + w, y + h])
+            raw_scores.append(0.81)
 
     # Secondary skin/geometry fallback for synthetic portraits
     if not raw_boxes:
@@ -549,9 +582,13 @@ def detect_faces_with_landmarks(
     results = []
     for idx in keep:
         x1, y1, x2, y2 = [int(v) for v in boxes_arr[idx]]
-        w, h = x2 - x1, y2 - y1
-        roi_gray = gray_eq[y1 : y1 + int(h * 0.6), x1:x2]
-        eyes = haar["eye"].detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=3, minSize=(8, 8))
+        w, h = max(1, x2 - x1), max(1, y2 - y1)
+        roi_gray = gray_eq[max(0, y1) : max(0, y1 + int(h * 0.6)), max(0, x1) : max(0, x2)]
+        eyes = (
+            haar["eye"].detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=3, minSize=(8, 8))
+            if roi_gray.size > 0 and not haar["eye"].empty()
+            else ()
+        )
         if len(eyes) >= 2:
             eyes_sorted = sorted(eyes, key=lambda e: e[0])[:2]
             ex1 = x1 + eyes_sorted[0][0] + eyes_sorted[0][2] // 2
@@ -614,7 +651,8 @@ def run_face_detector(
             crop = gray[max(0, y1) : min(h_img, y2), max(0, x1) : min(w_img, x2)]
             if crop.size > 0 and hog_info is not None:
                 vec = extract_hog_vector(crop)
-                d["svm_margin"] = round(float(np.dot(hog_info["weights"], vec) + hog_info["bias"]), 4)
+                if hog_info["weights"].shape[0] == vec.shape[0]:
+                    d["svm_margin"] = round(float(np.dot(hog_info["weights"], vec) + hog_info["bias"]), 4)
             if d["confidence"] >= conf_threshold:
                 detections.append(d)
         diagnostics["tensor_summary"] = "1764-D L2-Hys HOG Descriptor + Linear SVM Hyperplane"
@@ -756,6 +794,14 @@ def main():
     st.title("👤 Complete Multi-Model Face Detection Studio")
     st.caption("Fast-boot inference across PyTorch (.pth / .pt), Keras 3 (.keras), NumPy (.npz), and OpenCV")
 
+    if not CV2_AVAILABLE:
+        st.error(
+            "OpenCV (`cv2`) failed to initialize in this environment. "
+            "Ensure `opencv-python-headless>=4.10.0.84` is listed in `requirements.txt` (not `opencv-python`)."
+        )
+        st.code(CV2_ERROR, language="text")
+        st.stop()
+
     with st.sidebar:
         st.header("Detector Configuration")
         selected_model = st.selectbox(
@@ -826,7 +872,7 @@ def main():
         col_left, col_right = st.columns([3, 2])
         with col_left:
             st.subheader("Annotated Detection Output")
-            st.image(annotated, use_container_width=True)
+            render_image(annotated)
 
             out_pil = Image.fromarray(annotated)
             buf = io.BytesIO()
@@ -867,10 +913,9 @@ def main():
                     crop = input_rgb[max(0, y1) : max(0, y2), max(0, x1) : max(0, x2)]
                     if crop.size > 0:
                         with crop_cols[i % len(crop_cols)]:
-                            st.image(
+                            render_image(
                                 crop,
                                 caption=f"Face #{i+1} ({det['confidence']*100:.1f}%)",
-                                use_container_width=True,
                             )
             else:
                 st.warning("No faces matched the current confidence threshold. Lower the slider in the sidebar.")
@@ -896,10 +941,14 @@ def main():
                     input_rgb, dets, draw_landmarks=draw_landmarks, blur_faces=blur_faces, model_label=m_key.upper()
                 )
                 with preview_cols[idx % 2]:
-                    st.image(ann, caption=f"{MODEL_CATALOG[m_key]} — {diag['latency_ms']} ms", use_container_width=True)
+                    render_image(ann, caption=f"{MODEL_CATALOG[m_key]} — {diag['latency_ms']} ms")
 
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as runtime_exc:
+        st.error(f"Face Detection Studio encountered a runtime error: {runtime_exc}")
+        st.exception(runtime_exc)
